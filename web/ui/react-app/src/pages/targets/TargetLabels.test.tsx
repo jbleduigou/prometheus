@@ -31,8 +31,10 @@ describe('targetLabels', () => {
   it('wraps each label in a label badge', () => {
     const l: { [key: string]: string } = defaultProps.labels;
     Object.keys(l).forEach((labelName: string): void => {
-      const badge = targetLabels.find(Badge).filterWhere(badge => badge.hasClass(labelName));
-      expect(badge.children().text()).toEqual(`${labelName}="${l[labelName]}"`);
+      const badge = targetLabels
+        .find(Badge)
+        .filterWhere(badge => badge.children().text() === `${labelName}="${l[labelName]}"`);
+      expect(badge).toHaveLength(1);
     });
     expect(targetLabels.find(Badge)).toHaveLength(3);
   });
@@ -41,7 +43,7 @@ describe('targetLabels', () => {
     const tooltip = targetLabels.find(Tooltip);
     expect(tooltip).toHaveLength(1);
     expect(tooltip.prop('isOpen')).toBe(false);
-    expect(tooltip.prop('target')).toEqual('series-labels-cortex/node-exporter_group/0-1');
+    expect(tooltip.prop('target')).toEqual('series-labels-cortex\\/node-exporter_group\\/0-1');
   });
 
   it('renders discovered labels', () => {

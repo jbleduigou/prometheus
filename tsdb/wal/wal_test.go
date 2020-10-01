@@ -24,10 +24,15 @@ import (
 	"testing"
 
 	"github.com/prometheus/prometheus/tsdb/fileutil"
+	"go.uber.org/goleak"
 
 	client_testutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/prometheus/util/testutil"
 )
+
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m)
+}
 
 // TestWALRepair_ReadingError ensures that a repair is run for an error
 // when reading a record.
@@ -49,7 +54,7 @@ func TestWALRepair_ReadingError(t *testing.T) {
 		},
 		// Ensures that the page buffer is big enough to fit
 		// an entire page size without panicking.
-		// https://github.com/prometheus/prometheus/tsdb/pull/414
+		// https://github.com/prometheus/tsdb/pull/414
 		"bad_header": {
 			1,
 			func(f *os.File) {
@@ -133,7 +138,7 @@ func TestWALRepair_ReadingError(t *testing.T) {
 				records = append(records, b)
 				testutil.Ok(t, w.Log(b))
 			}
-			first, last, err := w.Segments()
+			first, last, err := Segments(w.Dir())
 			testutil.Ok(t, err)
 			testutil.Equals(t, 3, 1+last-first, "wal creation didn't result in expected number of segments")
 
@@ -151,7 +156,7 @@ func TestWALRepair_ReadingError(t *testing.T) {
 			testutil.Ok(t, err)
 			defer w.Close()
 
-			first, last, err = w.Segments()
+			first, last, err = Segments(w.Dir())
 			testutil.Ok(t, err)
 
 			// Backfill segments from the most recent checkpoint onwards.
@@ -196,7 +201,7 @@ func TestWALRepair_ReadingError(t *testing.T) {
 			}
 
 			// Make sure there is a new 0 size Segment after the corrupted Segment.
-			_, last, err = w.Segments()
+			_, last, err = Segments(w.Dir())
 			testutil.Ok(t, err)
 			testutil.Equals(t, test.corrSgm+1, last)
 			fi, err := os.Stat(SegmentName(dir, last))
@@ -302,7 +307,7 @@ func TestCorruptAndCarryOn(t *testing.T) {
 		err = w.Repair(corruptionErr)
 		testutil.Ok(t, err)
 
-		// Ensure that we have a completely clean slate after reapiring.
+		// Ensure that we have a completely clean slate after repairing.
 		testutil.Equals(t, w.segment.Index(), 1) // We corrupted segment 0.
 		testutil.Equals(t, w.donePages, 0)
 
@@ -379,7 +384,7 @@ func TestSegmentMetric(t *testing.T) {
 }
 
 func TestCompression(t *testing.T) {
-	boostrap := func(compressed bool) string {
+	bootstrap := func(compressed bool) string {
 		const (
 			segmentSize = pageSize
 			recordSize  = (pageSize / 2) - recordHeaderSize
@@ -401,11 +406,11 @@ func TestCompression(t *testing.T) {
 		return dirPath
 	}
 
-	dirCompressed := boostrap(true)
+	dirCompressed := bootstrap(true)
 	defer func() {
 		testutil.Ok(t, os.RemoveAll(dirCompressed))
 	}()
-	dirUnCompressed := boostrap(false)
+	dirUnCompressed := bootstrap(false)
 	defer func() {
 		testutil.Ok(t, os.RemoveAll(dirUnCompressed))
 	}()

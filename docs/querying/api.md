@@ -46,21 +46,20 @@ The JSON response envelope format is as follows:
 }
 ```
 
-Input timestamps may be provided either in
+Generic placeholders are defined as follows:
+
+* `<rfc3339 | unix_timestamp>`: Input timestamps may be provided either in
 [RFC3339](https://www.ietf.org/rfc/rfc3339.txt) format or as a Unix timestamp
 in seconds, with optional decimal places for sub-second precision. Output
 timestamps are always represented as Unix timestamps in seconds.
-
-Names of query parameters that may be repeated end with `[]`.
-
-`<series_selector>` placeholders refer to Prometheus [time series
+* `<series_selector>`: Prometheus [time series
 selectors](basics.md#time-series-selectors) like `http_requests_total` or
 `http_requests_total{method=~"(GET|POST)"}` and need to be URL-encoded.
+* `<duration>`: [Prometheus duration strings](basics.md#time_durations).
+For example, `5m` refers to a duration of 5 minutes.
+* `<bool>`: boolean values (strings `true` and `false`).
 
-`<duration>` placeholders refer to Prometheus duration strings of the form
-`[0-9]+[smhdwy]`. For example, `5m` refers to a duration of 5 minutes.
-
-`<bool>` placeholders refer to boolean values (strings `true` and `false`).
+Note: Names of query parameters that may be repeated end with `[]`.
 
 ## Expression queries
 
@@ -236,7 +235,7 @@ The following example returns all series that match either of the selectors
 `up` or `process_start_time_seconds{job="prometheus"}`:
 
 ```json
-$ curl -g 'http://localhost:9090/api/v1/series?' --data-urlencode='match[]=up' --data-urlencode='match[]=process_start_time_seconds{job="prometheus"}'
+$ curl -g 'http://localhost:9090/api/v1/series?' --data-urlencode 'match[]=up' --data-urlencode 'match[]=process_start_time_seconds{job="prometheus"}'
 {
    "status" : "success",
    "data" : [
@@ -267,6 +266,12 @@ The following endpoint returns a list of label names:
 GET /api/v1/labels
 POST /api/v1/labels
 ```
+
+URL query parameters:
+
+- `start=<rfc3339 | unix_timestamp>`: Start timestamp. Optional.
+- `end=<rfc3339 | unix_timestamp>`: End timestamp. Optional.
+
 
 The `data` section of the JSON response is a list of string label names.
 
@@ -309,6 +314,12 @@ The following endpoint returns a list of label values for a provided label name:
 ```
 GET /api/v1/label/<label_name>/values
 ```
+
+URL query parameters:
+
+- `start=<rfc3339 | unix_timestamp>`: Start timestamp. Optional.
+- `end=<rfc3339 | unix_timestamp>`: End timestamp. Optional.
+
 
 The `data` section of the JSON response is a list of string label values.
 
@@ -482,6 +493,9 @@ guarantees as the overarching API v1.
 GET /api/v1/rules
 ```
 
+URL query parameters:
+- `type=alert|record`: return only the alerting rules (e.g. `type=alert`) or the recording rules (e.g. `type=record`). When the parameter is absent or empty, no filtering is done.
+
 ```json
 $ curl http://localhost:9090/api/v1/rules
 
@@ -520,7 +534,7 @@ $ curl http://localhost:9090/api/v1/rules
                     {
                         "health": "ok",
                         "name": "job:http_inprogress_requests:sum",
-                        "query": "sum(http_inprogress_requests) by (job)",
+                        "query": "sum by (job) (http_inprogress_requests)",
                         "type": "recording"
                     }
                 ],
@@ -569,7 +583,7 @@ $ curl http://localhost:9090/api/v1/alerts
 
 ## Querying target metadata
 
-The following endpoint returns metadata about metrics currently scraped by targets.
+The following endpoint returns metadata about metrics currently scraped from targets.
 This is **experimental** and might change in the future.
 
 ```
@@ -650,6 +664,77 @@ curl -G http://localhost:9091/api/v1/targets/metadata \
     },
     // ...
   ]
+}
+```
+
+## Querying metric metadata
+
+It returns metadata about metrics currently scrapped from targets. However, it does not provide any target information.
+This is considered **experimental** and might change in the future.
+
+```
+GET /api/v1/metadata
+```
+
+URL query parameters:
+
+- `limit=<number>`: Maximum number of metrics to return.
+- `metric=<string>`: A metric name to filter metadata for. All metric metadata is retrieved if left empty.
+
+The `data` section of the query result consists of an object where each key is a metric name and each value is a list of unique metadata objects, as exposed for that metric name across all targets.
+
+The following example returns two metrics. Note that the metric `http_requests_total` has more than one object in the list. At least one target has a value for `HELP` that do not match with the rest.
+
+```json
+curl -G http://localhost:9090/api/v1/metadata?limit=2
+
+{
+  "status": "success",
+  "data": {
+    "cortex_ring_tokens": [
+      {
+        "type": "gauge",
+        "help": "Number of tokens in the ring",
+        "unit": ""
+      }
+    ],
+    "http_requests_total": [
+      {
+        "type": "counter",
+        "help": "Number of HTTP requests",
+        "unit": ""
+      },
+      {
+        "type": "counter",
+        "help": "Amount of HTTP requests",
+        "unit": ""
+      }
+    ]
+  }
+}
+```
+
+The following example returns metadata only for the metric `http_requests_total`.
+
+```json
+curl -G http://localhost:9090/api/v1/metadata?metric=http_requests_total
+
+{
+  "status": "success",
+  "data": {
+    "http_requests_total": [
+      {
+        "type": "counter",
+        "help": "Number of HTTP requests",
+        "unit": ""
+      },
+      {
+        "type": "counter",
+        "help": "Amount of HTTP requests",
+        "unit": ""
+      }
+    ]
+  }
 }
 ```
 
@@ -754,7 +839,6 @@ $ curl http://localhost:9090/api/v1/status/runtimeinfo
     "CWD": "/",
     "reloadConfigSuccess": true,
     "lastConfigTime": "2019-11-02T17:23:59+01:00",
-    "chunkCount": 873,
     "timeSeriesCount": 873,
     "corruptionCount": 0,
     "goroutineCount": 48,
@@ -797,6 +881,8 @@ $ curl http://localhost:9090/api/v1/status/buildinfo
 
 **NOTE**: The exact returned build properties may change without notice between Prometheus versions.
 
+*New in v2.14*
+
 ### TSDB Stats
 
 The following endpoint returns various cardinality statistics about the Prometheus TSDB:
@@ -804,6 +890,11 @@ The following endpoint returns various cardinality statistics about the Promethe
 ```
 GET /api/v1/status/tsdb
 ```
+- **headStats**: This provides the following data about the head block of the TSDB:
+  - **numSeries**: The number of series.
+  - **chunkCount**: The number of chunks.
+  - **minTime**: The current minimum timestamp in milliseconds.
+  - **maxTime**: The current maximum timestamp in milliseconds.
 - **seriesCountByMetricName:**  This will provide a list of metrics names and their series count.
 - **labelValueCountByLabelName:** This will provide a list of the label names and their value count.
 - **memoryInBytesByLabelName** This will provide a list of the label names and memory used in bytes. Memory usage is calculated by adding the length of all values for a given label name.
@@ -814,6 +905,12 @@ $ curl http://localhost:9090/api/v1/status/tsdb
 {
   "status": "success",
   "data": {
+    "headStats": {
+      "numSeries": 508,
+      "chunkCount": 937,
+      "minTime": 1591516800000,
+      "maxTime": 1598896800143,
+    },
     "seriesCountByMetricName": [
       {
         "name": "net_conntrack_dialer_conn_failed_total",
@@ -858,12 +955,10 @@ $ curl http://localhost:9090/api/v1/status/tsdb
 }
 ```
 
-*New in v2.14*
+*New in v2.15*
 
 ## TSDB Admin APIs
 These are APIs that expose database functionalities for the advanced user. These APIs are not enabled unless the `--web.enable-admin-api` is set.
-
-We also expose a gRPC API whose definition can be found [here](https://github.com/prometheus/prometheus/blob/master/prompb/rpc.proto). This is experimental and might change in the future.
 
 ### Snapshot
 Snapshot creates a snapshot of all current data into `snapshots/<datetime>-<rand>` under the TSDB's data directory and returns the directory as response.
@@ -892,7 +987,7 @@ The snapshot now exists at `<data-dir>/snapshots/20171210T211224Z-2be650b6d019eb
 *New in v2.1 and supports PUT from v2.9*
 
 ### Delete Series
-DeleteSeries deletes data for a selection of series in a time range. The actual data still exists on disk and is cleaned up in future compactions or can be explicitly cleaned up by hitting the Clean Tombstones endpoint.
+DeleteSeries deletes data for a selection of series in a time range. The actual data still exists on disk and is cleaned up in future compactions or can be explicitly cleaned up by hitting the [Clean Tombstones](#clean-tombstones) endpoint.
 
 If successful, a `204` is returned.
 

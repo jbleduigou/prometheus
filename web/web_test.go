@@ -15,12 +15,16 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -28,13 +32,11 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	prom_testutil "github.com/prometheus/client_golang/prometheus/testutil"
-
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/notifier"
 	"github.com/prometheus/prometheus/rules"
 	"github.com/prometheus/prometheus/scrape"
-	"github.com/prometheus/prometheus/storage/tsdb"
-	libtsdb "github.com/prometheus/prometheus/tsdb"
+	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/util/testutil"
 )
 
@@ -43,6 +45,7 @@ func TestMain(m *testing.M) {
 	os.Setenv("no_proxy", "localhost,127.0.0.1,0.0.0.0,:")
 	os.Exit(m.Run())
 }
+
 func TestGlobalURL(t *testing.T) {
 	opts := &Options{
 		ListenAddress: ":9090",
@@ -91,15 +94,22 @@ func TestGlobalURL(t *testing.T) {
 	}
 }
 
+type dbAdapter struct {
+	*tsdb.DB
+}
+
+func (a *dbAdapter) Stats(statsByLabelName string) (*tsdb.Stats, error) {
+	return a.Head().Stats(statsByLabelName), nil
+}
+
 func TestReadyAndHealthy(t *testing.T) {
 	t.Parallel()
+
 	dbDir, err := ioutil.TempDir("", "tsdb-ready")
-
 	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, os.RemoveAll(dbDir)) }()
 
-	defer os.RemoveAll(dbDir)
-	db, err := libtsdb.Open(dbDir, nil, nil, nil)
-
+	db, err := tsdb.Open(dbDir, nil, nil, nil)
 	testutil.Ok(t, err)
 
 	opts := &Options{
@@ -107,14 +117,15 @@ func TestReadyAndHealthy(t *testing.T) {
 		ReadTimeout:    30 * time.Second,
 		MaxConnections: 512,
 		Context:        nil,
-		Storage:        &tsdb.ReadyStorage{},
+		Storage:        nil,
+		LocalStorage:   &dbAdapter{db},
+		TSDBDir:        dbDir,
 		QueryEngine:    nil,
 		ScrapeManager:  &scrape.Manager{},
 		RuleManager:    &rules.Manager{},
 		Notifier:       nil,
 		RoutePrefix:    "/",
 		EnableAdminAPI: true,
-		TSDB:           func() *libtsdb.DB { return db },
 		ExternalURL: &url.URL{
 			Scheme: "http",
 			Host:   "localhost:9090",
@@ -131,8 +142,10 @@ func TestReadyAndHealthy(t *testing.T) {
 	webHandler.config = &config.Config{}
 	webHandler.notifier = &notifier.Manager{}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	go func() {
-		err := webHandler.Run(context.Background())
+		err := webHandler.Run(ctx)
 		if err != nil {
 			panic(fmt.Sprintf("Can't start web handler:%s", err))
 		}
@@ -143,154 +156,77 @@ func TestReadyAndHealthy(t *testing.T) {
 	time.Sleep(5 * time.Second)
 
 	resp, err := http.Get("http://localhost:9090/-/healthy")
-
 	testutil.Ok(t, err)
 	testutil.Equals(t, http.StatusOK, resp.StatusCode)
+	cleanupTestResponse(t, resp)
 
-	resp, err = http.Get("http://localhost:9090/-/ready")
+	for _, u := range []string{
+		"http://localhost:9090/-/ready",
+		"http://localhost:9090/version",
+		"http://localhost:9090/graph",
+		"http://localhost:9090/flags",
+		"http://localhost:9090/rules",
+		"http://localhost:9090/service-discovery",
+		"http://localhost:9090/targets",
+		"http://localhost:9090/status",
+		"http://localhost:9090/config",
+	} {
+		resp, err = http.Get(u)
+		testutil.Ok(t, err)
+		testutil.Equals(t, http.StatusServiceUnavailable, resp.StatusCode)
+		cleanupTestResponse(t, resp)
+	}
 
+	resp, err = http.Post("http://localhost:9090/api/v1/admin/tsdb/snapshot", "", strings.NewReader(""))
 	testutil.Ok(t, err)
 	testutil.Equals(t, http.StatusServiceUnavailable, resp.StatusCode)
+	cleanupTestResponse(t, resp)
 
-	resp, err = http.Get("http://localhost:9090/version")
-
+	resp, err = http.Post("http://localhost:9090/api/v1/admin/tsdb/delete_series", "", strings.NewReader("{}"))
 	testutil.Ok(t, err)
 	testutil.Equals(t, http.StatusServiceUnavailable, resp.StatusCode)
-
-	resp, err = http.Get("http://localhost:9090/graph")
-
-	testutil.Ok(t, err)
-	testutil.Equals(t, http.StatusServiceUnavailable, resp.StatusCode)
-
-	resp, err = http.Post("http://localhost:9090/api/v2/admin/tsdb/snapshot", "", strings.NewReader(""))
-
-	testutil.Ok(t, err)
-	testutil.Equals(t, http.StatusServiceUnavailable, resp.StatusCode)
-
-	resp, err = http.Post("http://localhost:9090/api/v2/admin/tsdb/delete_series", "", strings.NewReader("{}"))
-
-	testutil.Ok(t, err)
-	testutil.Equals(t, http.StatusServiceUnavailable, resp.StatusCode)
-
-	resp, err = http.Get("http://localhost:9090/graph")
-
-	testutil.Ok(t, err)
-	testutil.Equals(t, http.StatusServiceUnavailable, resp.StatusCode)
-
-	resp, err = http.Get("http://localhost:9090/alerts")
-
-	testutil.Ok(t, err)
-	testutil.Equals(t, http.StatusServiceUnavailable, resp.StatusCode)
-
-	resp, err = http.Get("http://localhost:9090/flags")
-
-	testutil.Ok(t, err)
-	testutil.Equals(t, http.StatusServiceUnavailable, resp.StatusCode)
-
-	resp, err = http.Get("http://localhost:9090/rules")
-
-	testutil.Ok(t, err)
-	testutil.Equals(t, http.StatusServiceUnavailable, resp.StatusCode)
-
-	resp, err = http.Get("http://localhost:9090/service-discovery")
-
-	testutil.Ok(t, err)
-	testutil.Equals(t, http.StatusServiceUnavailable, resp.StatusCode)
-
-	resp, err = http.Get("http://localhost:9090/targets")
-
-	testutil.Ok(t, err)
-	testutil.Equals(t, http.StatusServiceUnavailable, resp.StatusCode)
-
-	resp, err = http.Get("http://localhost:9090/config")
-
-	testutil.Ok(t, err)
-	testutil.Equals(t, http.StatusServiceUnavailable, resp.StatusCode)
-
-	resp, err = http.Get("http://localhost:9090/status")
-
-	testutil.Ok(t, err)
-	testutil.Equals(t, http.StatusServiceUnavailable, resp.StatusCode)
+	cleanupTestResponse(t, resp)
 
 	// Set to ready.
 	webHandler.Ready()
 
-	resp, err = http.Get("http://localhost:9090/-/healthy")
+	for _, u := range []string{
+		"http://localhost:9090/-/healthy",
+		"http://localhost:9090/-/ready",
+		"http://localhost:9090/version",
+		"http://localhost:9090/graph",
+		"http://localhost:9090/flags",
+		"http://localhost:9090/rules",
+		"http://localhost:9090/service-discovery",
+		"http://localhost:9090/targets",
+		"http://localhost:9090/status",
+		"http://localhost:9090/config",
+	} {
+		resp, err = http.Get(u)
+		testutil.Ok(t, err)
+		testutil.Equals(t, http.StatusOK, resp.StatusCode)
+		cleanupTestResponse(t, resp)
+	}
 
+	resp, err = http.Post("http://localhost:9090/api/v1/admin/tsdb/snapshot", "", strings.NewReader(""))
 	testutil.Ok(t, err)
 	testutil.Equals(t, http.StatusOK, resp.StatusCode)
+	cleanupSnapshot(t, dbDir, resp)
+	cleanupTestResponse(t, resp)
 
-	resp, err = http.Get("http://localhost:9090/-/ready")
-
+	resp, err = http.Post("http://localhost:9090/api/v1/admin/tsdb/delete_series?match[]=up", "", nil)
 	testutil.Ok(t, err)
-	testutil.Equals(t, http.StatusOK, resp.StatusCode)
-
-	resp, err = http.Get("http://localhost:9090/version")
-
-	testutil.Ok(t, err)
-	testutil.Equals(t, http.StatusOK, resp.StatusCode)
-
-	resp, err = http.Get("http://localhost:9090/graph")
-
-	testutil.Ok(t, err)
-	testutil.Equals(t, http.StatusOK, resp.StatusCode)
-
-	resp, err = http.Post("http://localhost:9090/api/v2/admin/tsdb/snapshot", "", strings.NewReader(""))
-
-	testutil.Ok(t, err)
-	testutil.Equals(t, http.StatusOK, resp.StatusCode)
-
-	resp, err = http.Post("http://localhost:9090/api/v2/admin/tsdb/delete_series", "", strings.NewReader("{}"))
-
-	testutil.Ok(t, err)
-	testutil.Equals(t, http.StatusOK, resp.StatusCode)
-
-	resp, err = http.Get("http://localhost:9090/alerts")
-
-	testutil.Ok(t, err)
-	testutil.Equals(t, http.StatusOK, resp.StatusCode)
-
-	resp, err = http.Get("http://localhost:9090/flags")
-
-	testutil.Ok(t, err)
-	testutil.Equals(t, http.StatusOK, resp.StatusCode)
-
-	resp, err = http.Get("http://localhost:9090/rules")
-
-	testutil.Ok(t, err)
-	testutil.Equals(t, http.StatusOK, resp.StatusCode)
-
-	resp, err = http.Get("http://localhost:9090/service-discovery")
-
-	testutil.Ok(t, err)
-	testutil.Equals(t, http.StatusOK, resp.StatusCode)
-
-	resp, err = http.Get("http://localhost:9090/targets")
-
-	testutil.Ok(t, err)
-	testutil.Equals(t, http.StatusOK, resp.StatusCode)
-
-	resp, err = http.Get("http://localhost:9090/config")
-
-	testutil.Ok(t, err)
-	testutil.Equals(t, http.StatusOK, resp.StatusCode)
-
-	resp, err = http.Get("http://localhost:9090/status")
-
-	testutil.Ok(t, err)
-	testutil.Equals(t, http.StatusOK, resp.StatusCode)
+	testutil.Equals(t, http.StatusNoContent, resp.StatusCode)
+	cleanupTestResponse(t, resp)
 }
 
 func TestRoutePrefix(t *testing.T) {
 	t.Parallel()
 	dbDir, err := ioutil.TempDir("", "tsdb-ready")
-
 	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, os.RemoveAll(dbDir)) }()
 
-	defer os.RemoveAll(dbDir)
-
-	db, err := libtsdb.Open(dbDir, nil, nil, nil)
-
+	db, err := tsdb.Open(dbDir, nil, nil, nil)
 	testutil.Ok(t, err)
 
 	opts := &Options{
@@ -298,21 +234,28 @@ func TestRoutePrefix(t *testing.T) {
 		ReadTimeout:    30 * time.Second,
 		MaxConnections: 512,
 		Context:        nil,
-		Storage:        &tsdb.ReadyStorage{},
+		TSDBDir:        dbDir,
+		LocalStorage:   &dbAdapter{db},
+		Storage:        nil,
 		QueryEngine:    nil,
 		ScrapeManager:  nil,
 		RuleManager:    nil,
 		Notifier:       nil,
 		RoutePrefix:    "/prometheus",
 		EnableAdminAPI: true,
-		TSDB:           func() *libtsdb.DB { return db },
+		ExternalURL: &url.URL{
+			Host:   "localhost.localdomain:9090",
+			Scheme: "http",
+		},
 	}
 
 	opts.Flags = map[string]string{}
 
 	webHandler := New(nil, opts)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	go func() {
-		err := webHandler.Run(context.Background())
+		err := webHandler.Run(ctx)
 		if err != nil {
 			panic(fmt.Sprintf("Can't start web handler:%s", err))
 		}
@@ -323,57 +266,58 @@ func TestRoutePrefix(t *testing.T) {
 	time.Sleep(5 * time.Second)
 
 	resp, err := http.Get("http://localhost:9091" + opts.RoutePrefix + "/-/healthy")
-
 	testutil.Ok(t, err)
 	testutil.Equals(t, http.StatusOK, resp.StatusCode)
+	cleanupTestResponse(t, resp)
 
 	resp, err = http.Get("http://localhost:9091" + opts.RoutePrefix + "/-/ready")
-
 	testutil.Ok(t, err)
 	testutil.Equals(t, http.StatusServiceUnavailable, resp.StatusCode)
+	cleanupTestResponse(t, resp)
 
 	resp, err = http.Get("http://localhost:9091" + opts.RoutePrefix + "/version")
-
 	testutil.Ok(t, err)
 	testutil.Equals(t, http.StatusServiceUnavailable, resp.StatusCode)
+	cleanupTestResponse(t, resp)
 
-	resp, err = http.Post("http://localhost:9091"+opts.RoutePrefix+"/api/v2/admin/tsdb/snapshot", "", strings.NewReader(""))
-
+	resp, err = http.Post("http://localhost:9091"+opts.RoutePrefix+"/api/v1/admin/tsdb/snapshot", "", strings.NewReader(""))
 	testutil.Ok(t, err)
 	testutil.Equals(t, http.StatusServiceUnavailable, resp.StatusCode)
+	cleanupTestResponse(t, resp)
 
-	resp, err = http.Post("http://localhost:9091"+opts.RoutePrefix+"/api/v2/admin/tsdb/delete_series", "", strings.NewReader("{}"))
-
+	resp, err = http.Post("http://localhost:9091"+opts.RoutePrefix+"/api/v1/admin/tsdb/delete_series", "", strings.NewReader("{}"))
 	testutil.Ok(t, err)
 	testutil.Equals(t, http.StatusServiceUnavailable, resp.StatusCode)
+	cleanupTestResponse(t, resp)
 
 	// Set to ready.
 	webHandler.Ready()
 
 	resp, err = http.Get("http://localhost:9091" + opts.RoutePrefix + "/-/healthy")
-
 	testutil.Ok(t, err)
 	testutil.Equals(t, http.StatusOK, resp.StatusCode)
+	cleanupTestResponse(t, resp)
 
 	resp, err = http.Get("http://localhost:9091" + opts.RoutePrefix + "/-/ready")
-
 	testutil.Ok(t, err)
 	testutil.Equals(t, http.StatusOK, resp.StatusCode)
+	cleanupTestResponse(t, resp)
 
 	resp, err = http.Get("http://localhost:9091" + opts.RoutePrefix + "/version")
-
 	testutil.Ok(t, err)
 	testutil.Equals(t, http.StatusOK, resp.StatusCode)
+	cleanupTestResponse(t, resp)
 
-	resp, err = http.Post("http://localhost:9091"+opts.RoutePrefix+"/api/v2/admin/tsdb/snapshot", "", strings.NewReader(""))
-
+	resp, err = http.Post("http://localhost:9091"+opts.RoutePrefix+"/api/v1/admin/tsdb/snapshot", "", strings.NewReader(""))
 	testutil.Ok(t, err)
 	testutil.Equals(t, http.StatusOK, resp.StatusCode)
+	cleanupSnapshot(t, dbDir, resp)
+	cleanupTestResponse(t, resp)
 
-	resp, err = http.Post("http://localhost:9091"+opts.RoutePrefix+"/api/v2/admin/tsdb/delete_series", "", strings.NewReader("{}"))
-
+	resp, err = http.Post("http://localhost:9091"+opts.RoutePrefix+"/api/v1/admin/tsdb/delete_series?match[]=up", "", nil)
 	testutil.Ok(t, err)
-	testutil.Equals(t, http.StatusOK, resp.StatusCode)
+	testutil.Equals(t, http.StatusNoContent, resp.StatusCode)
+	cleanupTestResponse(t, resp)
 }
 
 func TestDebugHandler(t *testing.T) {
@@ -391,7 +335,12 @@ func TestDebugHandler(t *testing.T) {
 		{"/foo", "/bar/debug/pprof/goroutine", 404},
 	} {
 		opts := &Options{
-			RoutePrefix: tc.prefix,
+			RoutePrefix:   tc.prefix,
+			ListenAddress: "somehost:9090",
+			ExternalURL: &url.URL{
+				Host:   "localhost.localdomain:9090",
+				Scheme: "http",
+			},
 		}
 		handler := New(nil, opts)
 		handler.Ready()
@@ -410,8 +359,14 @@ func TestDebugHandler(t *testing.T) {
 
 func TestHTTPMetrics(t *testing.T) {
 	t.Parallel()
-
-	handler := New(nil, &Options{RoutePrefix: "/"})
+	handler := New(nil, &Options{
+		RoutePrefix:   "/",
+		ListenAddress: "somehost:9090",
+		ExternalURL: &url.URL{
+			Host:   "localhost.localdomain:9090",
+			Scheme: "http",
+		},
+	})
 	getReady := func() int {
 		t.Helper()
 		w := httptest.NewRecorder()
@@ -435,4 +390,94 @@ func TestHTTPMetrics(t *testing.T) {
 	}
 	testutil.Equals(t, 2, int(prom_testutil.ToFloat64(counter.WithLabelValues("/-/ready", strconv.Itoa(http.StatusOK)))))
 	testutil.Equals(t, 1, int(prom_testutil.ToFloat64(counter.WithLabelValues("/-/ready", strconv.Itoa(http.StatusServiceUnavailable)))))
+}
+
+func TestShutdownWithStaleConnection(t *testing.T) {
+	dbDir, err := ioutil.TempDir("", "tsdb-ready")
+	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, os.RemoveAll(dbDir)) }()
+
+	db, err := tsdb.Open(dbDir, nil, nil, nil)
+	testutil.Ok(t, err)
+
+	timeout := 10 * time.Second
+
+	opts := &Options{
+		ListenAddress:  ":9090",
+		ReadTimeout:    timeout,
+		MaxConnections: 512,
+		Context:        nil,
+		Storage:        nil,
+		LocalStorage:   &dbAdapter{db},
+		TSDBDir:        dbDir,
+		QueryEngine:    nil,
+		ScrapeManager:  &scrape.Manager{},
+		RuleManager:    &rules.Manager{},
+		Notifier:       nil,
+		RoutePrefix:    "/",
+		ExternalURL: &url.URL{
+			Scheme: "http",
+			Host:   "localhost:9090",
+			Path:   "/",
+		},
+		Version:  &PrometheusVersion{},
+		Gatherer: prometheus.DefaultGatherer,
+	}
+
+	opts.Flags = map[string]string{}
+
+	webHandler := New(nil, opts)
+
+	webHandler.config = &config.Config{}
+	webHandler.notifier = &notifier.Manager{}
+
+	closed := make(chan struct{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		err := webHandler.Run(ctx)
+		if err != nil {
+			panic(fmt.Sprintf("Can't start web handler:%s", err))
+		}
+		close(closed)
+	}()
+
+	// Give some time for the web goroutine to run since we need the server
+	// to be up before starting tests.
+	time.Sleep(5 * time.Second)
+
+	// Open a socket, and don't use it. This connection should then be closed
+	// after the ReadTimeout.
+	c, err := net.Dial("tcp", "localhost:9090")
+	testutil.Ok(t, err)
+	t.Cleanup(func() { testutil.Ok(t, c.Close()) })
+
+	// Stop the web handler.
+	cancel()
+
+	select {
+	case <-closed:
+	case <-time.After(timeout + 5*time.Second):
+		t.Fatalf("Server still running after read timeout.")
+	}
+}
+
+func cleanupTestResponse(t *testing.T, resp *http.Response) {
+	_, err := io.Copy(ioutil.Discard, resp.Body)
+	testutil.Ok(t, err)
+	testutil.Ok(t, resp.Body.Close())
+}
+
+func cleanupSnapshot(t *testing.T, dbDir string, resp *http.Response) {
+	snapshot := &struct {
+		Data struct {
+			Name string `json:"name"`
+		} `json:"data"`
+	}{}
+	b, err := ioutil.ReadAll(resp.Body)
+	testutil.Ok(t, err)
+	testutil.Ok(t, json.Unmarshal(b, snapshot))
+	testutil.Assert(t, snapshot.Data.Name != "", "snapshot directory not returned")
+	testutil.Ok(t, os.Remove(filepath.Join(dbDir, "snapshots", snapshot.Data.Name)))
+	testutil.Ok(t, os.Remove(filepath.Join(dbDir, "snapshots")))
 }

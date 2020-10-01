@@ -18,10 +18,10 @@ import (
 	"fmt"
 	"hash"
 	"hash/crc32"
-	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 
 	"github.com/go-kit/kit/log"
@@ -38,7 +38,8 @@ const (
 	// MagicTombstone is 4 bytes at the head of a tombstone file.
 	MagicTombstone = 0x0130BA30
 
-	tombstoneFormatV1 = 1
+	tombstoneFormatV1    = 1
+	tombstonesHeaderSize = 5
 )
 
 // The table gets initialized with sync.Once but may still cause a race
@@ -96,33 +97,27 @@ func WriteFile(logger log.Logger, dir string, tr Reader) (int64, error) {
 	buf.Reset()
 	// Write the meta.
 	buf.PutBE32(MagicTombstone)
-	buf.PutByte(tombstoneFormatV1)
 	n, err := f.Write(buf.Get())
 	if err != nil {
 		return 0, err
 	}
 	size += n
 
-	mw := io.MultiWriter(f, hash)
-
-	if err := tr.Iter(func(ref uint64, ivs Intervals) error {
-		for _, iv := range ivs {
-			buf.Reset()
-
-			buf.PutUvarint64(ref)
-			buf.PutVarint64(iv.Mint)
-			buf.PutVarint64(iv.Maxt)
-
-			n, err = mw.Write(buf.Get())
-			if err != nil {
-				return err
-			}
-			size += n
-		}
-		return nil
-	}); err != nil {
-		return 0, fmt.Errorf("error writing tombstones: %v", err)
+	bytes, err := Encode(tr)
+	if err != nil {
+		return 0, errors.Wrap(err, "encoding tombstones")
 	}
+
+	// Ignore first byte which is the format type. We do this for compatibility.
+	if _, err := hash.Write(bytes[1:]); err != nil {
+		return 0, errors.Wrap(err, "calculating hash for tombstones")
+	}
+
+	n, err = f.Write(bytes)
+	if err != nil {
+		return 0, errors.Wrap(err, "writing tombstones")
+	}
+	size += n
 
 	n, err = f.Write(hash.Sum(nil))
 	if err != nil {
@@ -143,6 +138,48 @@ func WriteFile(logger log.Logger, dir string, tr Reader) (int64, error) {
 	return int64(size), fileutil.Replace(tmp, path)
 }
 
+// Encode encodes the tombstones from the reader.
+// It does not attach any magic number or checksum.
+func Encode(tr Reader) ([]byte, error) {
+	buf := encoding.Encbuf{}
+	buf.PutByte(tombstoneFormatV1)
+	err := tr.Iter(func(ref uint64, ivs Intervals) error {
+		for _, iv := range ivs {
+			buf.PutUvarint64(ref)
+			buf.PutVarint64(iv.Mint)
+			buf.PutVarint64(iv.Maxt)
+		}
+		return nil
+	})
+	return buf.Get(), err
+}
+
+// Decode decodes the tombstones from the bytes
+// which was encoded using the Encode method.
+func Decode(b []byte) (Reader, error) {
+	d := &encoding.Decbuf{B: b}
+	if flag := d.Byte(); flag != tombstoneFormatV1 {
+		return nil, errors.Errorf("invalid tombstone format %x", flag)
+	}
+
+	if d.Err() != nil {
+		return nil, d.Err()
+	}
+
+	stonesMap := NewMemTombstones()
+	for d.Len() > 0 {
+		k := d.Uvarint64()
+		mint := d.Varint64()
+		maxt := d.Varint64()
+		if d.Err() != nil {
+			return nil, d.Err()
+		}
+
+		stonesMap.AddInterval(k, Interval{mint, maxt})
+	}
+	return stonesMap, nil
+}
+
 // Stone holds the information on the posting and time-range
 // that is deleted.
 type Stone struct {
@@ -158,7 +195,7 @@ func ReadTombstones(dir string) (Reader, int64, error) {
 		return nil, 0, err
 	}
 
-	if len(b) < 5 {
+	if len(b) < tombstonesHeaderSize {
 		return nil, 0, errors.Wrap(encoding.ErrInvalidSize, "tombstones header")
 	}
 
@@ -166,51 +203,41 @@ func ReadTombstones(dir string) (Reader, int64, error) {
 	if mg := d.Be32(); mg != MagicTombstone {
 		return nil, 0, fmt.Errorf("invalid magic number %x", mg)
 	}
-	if flag := d.Byte(); flag != tombstoneFormatV1 {
-		return nil, 0, fmt.Errorf("invalid tombstone format %x", flag)
-	}
-
-	if d.Err() != nil {
-		return nil, 0, d.Err()
-	}
 
 	// Verify checksum.
 	hash := newCRC32()
-	if _, err := hash.Write(d.Get()); err != nil {
+	// Ignore first byte which is the format type.
+	if _, err := hash.Write(d.Get()[1:]); err != nil {
 		return nil, 0, errors.Wrap(err, "write to hash")
 	}
 	if binary.BigEndian.Uint32(b[len(b)-4:]) != hash.Sum32() {
 		return nil, 0, errors.New("checksum did not match")
 	}
 
-	stonesMap := NewMemTombstones()
+	if d.Err() != nil {
+		return nil, 0, d.Err()
+	}
 
-	for d.Len() > 0 {
-		k := d.Uvarint64()
-		mint := d.Varint64()
-		maxt := d.Varint64()
-		if d.Err() != nil {
-			return nil, 0, d.Err()
-		}
-
-		stonesMap.AddInterval(k, Interval{mint, maxt})
+	stonesMap, err := Decode(d.Get())
+	if err != nil {
+		return nil, 0, err
 	}
 
 	return stonesMap, int64(len(b)), nil
 }
 
-type memTombstones struct {
+type MemTombstones struct {
 	intvlGroups map[uint64]Intervals
 	mtx         sync.RWMutex
 }
 
 // NewMemTombstones creates new in memory Tombstone Reader
 // that allows adding new intervals.
-func NewMemTombstones() *memTombstones {
-	return &memTombstones{intvlGroups: make(map[uint64]Intervals)}
+func NewMemTombstones() *MemTombstones {
+	return &MemTombstones{intvlGroups: make(map[uint64]Intervals)}
 }
 
-func NewTestMemTombstones(intervals []Intervals) *memTombstones {
+func NewTestMemTombstones(intervals []Intervals) *MemTombstones {
 	ret := NewMemTombstones()
 	for i, intervalsGroup := range intervals {
 		for _, interval := range intervalsGroup {
@@ -220,13 +247,13 @@ func NewTestMemTombstones(intervals []Intervals) *memTombstones {
 	return ret
 }
 
-func (t *memTombstones) Get(ref uint64) (Intervals, error) {
+func (t *MemTombstones) Get(ref uint64) (Intervals, error) {
 	t.mtx.RLock()
 	defer t.mtx.RUnlock()
 	return t.intvlGroups[ref], nil
 }
 
-func (t *memTombstones) Iter(f func(uint64, Intervals) error) error {
+func (t *MemTombstones) Iter(f func(uint64, Intervals) error) error {
 	t.mtx.RLock()
 	defer t.mtx.RUnlock()
 	for ref, ivs := range t.intvlGroups {
@@ -237,7 +264,7 @@ func (t *memTombstones) Iter(f func(uint64, Intervals) error) error {
 	return nil
 }
 
-func (t *memTombstones) Total() uint64 {
+func (t *MemTombstones) Total() uint64 {
 	t.mtx.RLock()
 	defer t.mtx.RUnlock()
 
@@ -249,7 +276,7 @@ func (t *memTombstones) Total() uint64 {
 }
 
 // AddInterval to an existing memTombstones.
-func (t *memTombstones) AddInterval(ref uint64, itvs ...Interval) {
+func (t *MemTombstones) AddInterval(ref uint64, itvs ...Interval) {
 	t.mtx.Lock()
 	defer t.mtx.Unlock()
 	for _, itv := range itvs {
@@ -257,7 +284,7 @@ func (t *memTombstones) AddInterval(ref uint64, itvs ...Interval) {
 	}
 }
 
-func (*memTombstones) Close() error {
+func (*MemTombstones) Close() error {
 	return nil
 }
 
@@ -285,47 +312,32 @@ type Intervals []Interval
 
 // Add the new time-range to the existing ones.
 // The existing ones must be sorted.
-func (itvs Intervals) Add(n Interval) Intervals {
-	for i, r := range itvs {
-		// TODO(gouthamve): Make this codepath easier to digest.
-		if r.InBounds(n.Mint-1) || r.InBounds(n.Mint) {
-			if n.Maxt > r.Maxt {
-				itvs[i].Maxt = n.Maxt
-			}
-
-			j := 0
-			for _, r2 := range itvs[i+1:] {
-				if n.Maxt < r2.Mint {
-					break
-				}
-				j++
-			}
-			if j != 0 {
-				if itvs[i+j].Maxt > n.Maxt {
-					itvs[i].Maxt = itvs[i+j].Maxt
-				}
-				itvs = append(itvs[:i+1], itvs[i+j+1:]...)
-			}
-			return itvs
-		}
-
-		if r.InBounds(n.Maxt+1) || r.InBounds(n.Maxt) {
-			if n.Mint < r.Maxt {
-				itvs[i].Mint = n.Mint
-			}
-			return itvs
-		}
-
-		if n.Mint < r.Mint {
-			newRange := make(Intervals, i, len(itvs[:i])+1)
-			copy(newRange, itvs[:i])
-			newRange = append(newRange, n)
-			newRange = append(newRange, itvs[i:]...)
-
-			return newRange
-		}
+func (in Intervals) Add(n Interval) Intervals {
+	if len(in) == 0 {
+		return append(in, n)
+	}
+	// Find min and max indexes of intervals that overlap with the new interval.
+	// Intervals are closed [t1, t2] and t is discreet, so if neighbour intervals are 1 step difference
+	// to the new one, we can merge those together.
+	mini := sort.Search(len(in), func(i int) bool { return in[i].Maxt >= n.Mint-1 })
+	if mini == len(in) {
+		return append(in, n)
 	}
 
-	itvs = append(itvs, n)
-	return itvs
+	maxi := sort.Search(len(in)-mini, func(i int) bool { return in[mini+i].Mint > n.Maxt+1 })
+	if maxi == 0 {
+		if mini == 0 {
+			return append(Intervals{n}, in...)
+		}
+		return append(in[:mini], append(Intervals{n}, in[mini:]...)...)
+	}
+
+	if n.Mint < in[mini].Mint {
+		in[mini].Mint = n.Mint
+	}
+	in[mini].Maxt = in[maxi+mini-1].Maxt
+	if n.Maxt > in[mini].Maxt {
+		in[mini].Maxt = n.Maxt
+	}
+	return append(in[:mini+1], in[maxi+mini:]...)
 }
